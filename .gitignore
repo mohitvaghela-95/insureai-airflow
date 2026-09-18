@@ -1,0 +1,12 @@
+.venv
+.DS_Store
+.env
+*__pycache__/
+airflow.db
+.gitignore
+airflow.db-shm
+airflow.db-wal
+test_data
+simple_auth_manager_passwords.json.generated
+airflow.cfg
+!.gitignore
