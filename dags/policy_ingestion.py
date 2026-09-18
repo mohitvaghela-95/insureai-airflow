@@ -5,10 +5,20 @@ from pathlib import Path
 
 from airflow.sdk import PokeReturnValue, dag, task
 from dotenv import load_dotenv
-from openai import OpenAI
+from langchain_core.documents import Document
+from langchain_openai import OpenAIEmbeddings
+from langchain_pinecone import PineconeVectorStore
+from pinecone import Pinecone, ServerlessSpec
 from pypdf import PdfReader
+from uuid6 import uuid6
 
 load_dotenv()
+FILE_PATH_RAW = os.environ["FILE_PATH_RAW"]
+FILE_PATH_PROCESSED = os.environ["FILE_PATH_PROCESSED"]
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+EMBEDDING_MODEL = os.environ["EMBEDDING_MODEL"]
+PINECONE_API_KEY = os.environ["PINECONE_API_KEY"]
+PINECONE_INDEX_NAME = os.environ["PINECONE_INDEX_NAME"]
 
 
 @dag(
@@ -21,7 +31,7 @@ def policy_ingestion():
 
     @task.sensor(poke_interval=30, timeout=60 * 60 * 24, mode="reschedule")
     def wait_for_pdf():
-        raw_path = os.getenv("FILE_PATH_RAW")
+        raw_path = FILE_PATH_RAW
 
         if raw_path:
             raw_path = Path(raw_path)
@@ -38,61 +48,84 @@ def policy_ingestion():
         )
 
     @task()
-    def extract_text(pdf_path: str | Path):
+    def extract_documents(pdf_path: str | Path):
         """Extract text from every page in a PDF file."""
 
         reader = PdfReader(pdf_path)
 
-        pages = [page.extract_text() for page in reader.pages]
+        documents = []
+        for i, page in enumerate(reader.pages):
+            doc = Document(
+                page_content=page.extract_text(),
+                metadata={"source": pdf_path, "page_num": i + 1},
+            )
+            documents.append(doc)
 
-        text = " ".join(pages)
-
-        return text
+        return documents
 
     @task()
-    def chunk_text(
-        text: str, chunk_size: int = 900, chunk_overlap: int = 150
-    ) -> list[str] | None:
+    def chunk_documents(
+        documents: list[Document], chunk_size: int = 900, chunk_overlap: int = 150
+    ) -> list[Document] | None:
+        chunks = []
+        for doc in documents:
+            text = doc.page_content
+            text_length = len(text)
 
-        chunks: list[str] = []
-        text_length = len(text)
-        # print("text len: ", text_length)
+            if text_length == 0:
+                continue
 
-        if text_length == 0:
-            return chunks
+            start = 0
+            c_index = 0
+            while start < text_length:
+                # Calculate end position
+                end = min(start + chunk_size, text_length)
+                # print(f"end: {end}")
 
-        start = 0
-        while start < text_length:
-            # Calculate end position
-            end = min(start + chunk_size, text_length)
-            # print(f"end: {end}")
+                # Extract chunk
+                chunk = text[start:end]
+                if chunk:  # Only add non-empty chunks
+                    d = Document(
+                        page_content=chunk,
+                        metadata={
+                            "source": str(doc.metadata["source"]),
+                            "page_num": doc.metadata["page_num"],
+                            "chunk_index": c_index,
+                        },
+                    )
+                    chunks.append(d)
 
-            # Extract chunk
-            chunk = text[start:end]
-            if chunk:  # Only add non-empty chunks
-                chunks.append(chunk)
-                # print(f"appended {start}:{end}")
+                    c_index += 1
 
-            # If we have reached the last chunk then break
-            if end >= text_length:
-                break
+                # If we have reached the last chunk then break
+                if end >= text_length:
+                    break
 
-            # Calculate next starting position
-            start = end - chunk_overlap
-            # print(f"Starting new chunk from index: {start}")
+                # Calculate next starting position
+                start = end - chunk_overlap
+                # print(f"Starting new chunk from index: {start}")
 
         return chunks
 
     @task()
-    def embed_chunks(chunks: list[str]):
-        api_key = os.getenv("OPENAI_API_KEY")
-        model = os.getenv("EMBEDDING_MODEL")
+    def embed_chunks(chunks: list[Document]):
+        pc = Pinecone(PINECONE_API_KEY)
 
-        if api_key and model:
-            client = OpenAI(api_key=api_key)
-            response = client.embeddings.create(model=model, input=chunks)
+        # Create index if it doesnt exist
+        if not pc.has_index(PINECONE_INDEX_NAME):
+            pc.create_index(
+                name=PINECONE_INDEX_NAME,
+                metric="cosine",
+                dimension=1536,
+                spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+            )
 
-        return response.data
+        index = pc.Index(PINECONE_INDEX_NAME)
+        embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+        vector_store = PineconeVectorStore(index=index, embedding=embeddings)
+        uuids = [str(uuid6()) for _ in range(len(chunks))]
+
+        vector_store.add_documents(documents=chunks, uuids=uuids)
 
     @task()
     def structure_metadata():
@@ -104,7 +137,7 @@ def policy_ingestion():
 
     @task()
     def move_file_to_processed(source):
-        destination = Path(os.getenv("FILE_PATH_PROCESSED"))  # type: ignore
+        destination = Path(FILE_PATH_PROCESSED)  # type: ignore
         source = Path(source)
 
         if destination:
@@ -114,8 +147,8 @@ def policy_ingestion():
         return f"File moved to: {destination}"
 
     pdf_path = wait_for_pdf()
-    text = extract_text(pdf_path)  # type: ignore
-    chunks = chunk_text(text)  # type: ignore
+    documents = extract_documents(pdf_path)  # type: ignore
+    chunks = chunk_documents(documents)  # type: ignore
     embeddings = embed_chunks(chunks)  # type: ignore
 
     move_task = move_file_to_processed(pdf_path)
