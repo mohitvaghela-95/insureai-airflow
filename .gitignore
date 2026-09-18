@@ -10,3 +10,4 @@ test_data
 simple_auth_manager_passwords.json.generated
 airflow.cfg
 !.gitignore
+testing.py
