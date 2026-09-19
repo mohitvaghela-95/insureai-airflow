@@ -1,3 +1,4 @@
+import logging
 import os
 import shutil
 from datetime import datetime
@@ -9,16 +10,27 @@ from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
 from pinecone import Pinecone, ServerlessSpec
-from pypdf import PdfReader
 from uuid6 import uuid6
 
+from ingestion_artifacts import (
+    chunk_page_records,
+    create_artifact_path,
+    extract_page_records,
+    read_records,
+    write_records,
+)
+
 load_dotenv()
-FILE_PATH_RAW = os.environ["FILE_PATH_RAW"]
-FILE_PATH_PROCESSED = os.environ["FILE_PATH_PROCESSED"]
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-EMBEDDING_MODEL = os.environ["EMBEDDING_MODEL"]
-PINECONE_API_KEY = os.environ["PINECONE_API_KEY"]
-PINECONE_INDEX_NAME = os.environ["PINECONE_INDEX_NAME"]
+logger = logging.getLogger(__name__)
+
+
+def required_setting(setting_name: str) -> str:
+    """Read required runtime configuration without breaking DAG parsing."""
+
+    value = os.getenv(setting_name)
+    if not value:
+        raise ValueError(f"{setting_name} must be configured before this task runs")
+    return value
 
 
 @dag(
@@ -28,132 +40,92 @@ PINECONE_INDEX_NAME = os.environ["PINECONE_INDEX_NAME"]
     max_active_runs=1,
 )
 def policy_ingestion():
-
     @task.sensor(poke_interval=30, timeout=60 * 60 * 24, mode="reschedule")
     def wait_for_pdf():
-        raw_path = FILE_PATH_RAW
-
-        if raw_path:
-            raw_path = Path(raw_path)
-            pdf_files = list(raw_path.glob("*.pdf"))
+        raw_path = Path(required_setting("FILE_PATH_RAW"))
+        pdf_files = list(raw_path.glob("*.pdf"))
 
         if not pdf_files:
             return PokeReturnValue(is_done=False)
 
-        file_path = pdf_files[0]
+        return PokeReturnValue(is_done=True, xcom_value=str(pdf_files[0]))
 
-        return PokeReturnValue(
-            is_done=True,
-            xcom_value=str(file_path),
+    @task()
+    def extract_documents(pdf_path: str) -> str:
+        """Extract PDF pages to a staged artifact and return its path via XCom."""
+
+        page_artifact = create_artifact_path(
+            required_setting("FILE_PATH_STAGING"), pdf_path, "pages"
         )
+        return str(write_records(page_artifact, extract_page_records(pdf_path)))
 
     @task()
-    def extract_documents(pdf_path: str | Path):
-        """Extract text from every page in a PDF file."""
+    def chunk_documents(page_artifact_path: str) -> str:
+        """Chunk staged pages and return the chunk artifact path via XCom."""
 
-        reader = PdfReader(pdf_path)
-
-        documents = []
-        for i, page in enumerate(reader.pages):
-            doc = Document(
-                page_content=page.extract_text(),
-                metadata={"source": pdf_path, "page_num": i + 1},
-            )
-            documents.append(doc)
-
-        return documents
+        chunk_artifact = create_artifact_path(
+            required_setting("FILE_PATH_STAGING"), page_artifact_path, "chunks"
+        )
+        chunks = chunk_page_records(read_records(page_artifact_path))
+        return str(write_records(chunk_artifact, chunks))
 
     @task()
-    def chunk_documents(
-        documents: list[Document], chunk_size: int = 900, chunk_overlap: int = 150
-    ) -> list[Document] | None:
-        chunks = []
-        for doc in documents:
-            text = doc.page_content
-            text_length = len(text)
+    def embed_chunks(chunk_artifact_path: str):
+        """Create LangChain Documents locally from staged records for embedding."""
 
-            if text_length == 0:
-                continue
+        pc = Pinecone(required_setting("PINECONE_API_KEY"))
+        index_name = required_setting("PINECONE_INDEX_NAME")
 
-            start = 0
-            c_index = 0
-            while start < text_length:
-                # Calculate end position
-                end = min(start + chunk_size, text_length)
-                # print(f"end: {end}")
-
-                # Extract chunk
-                chunk = text[start:end]
-                if chunk:  # Only add non-empty chunks
-                    d = Document(
-                        page_content=chunk,
-                        metadata={
-                            "source": str(doc.metadata["source"]),
-                            "page_num": doc.metadata["page_num"],
-                            "chunk_index": c_index,
-                        },
-                    )
-                    chunks.append(d)
-
-                    c_index += 1
-
-                # If we have reached the last chunk then break
-                if end >= text_length:
-                    break
-
-                # Calculate next starting position
-                start = end - chunk_overlap
-                # print(f"Starting new chunk from index: {start}")
-
-        return chunks
-
-    @task()
-    def embed_chunks(chunks: list[Document]):
-        pc = Pinecone(PINECONE_API_KEY)
-
-        # Create index if it doesnt exist
-        if not pc.has_index(PINECONE_INDEX_NAME):
+        if not pc.has_index(index_name):
             pc.create_index(
-                name=PINECONE_INDEX_NAME,
+                name=index_name,
                 metric="cosine",
                 dimension=1536,
                 spec=ServerlessSpec(cloud="aws", region="us-east-1"),
             )
 
-        index = pc.Index(PINECONE_INDEX_NAME)
-        embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+        documents = [
+            Document(page_content=record["page_content"], metadata=record["metadata"])
+            for record in read_records(chunk_artifact_path)
+        ]
+        if not documents:
+            logger.info(
+                "No text chunks found in %s; skipping embedding.", chunk_artifact_path
+            )
+            return
+
+        index = pc.Index(index_name)
+        embeddings = OpenAIEmbeddings(model=required_setting("EMBEDDING_MODEL"))
         vector_store = PineconeVectorStore(index=index, embedding=embeddings)
-        uuids = [str(uuid6()) for _ in range(len(chunks))]
-
-        vector_store.add_documents(documents=chunks, uuids=uuids)
-
-    @task()
-    def structure_metadata():
-        pass
+        uuids = [str(uuid6()) for _ in documents]
+        vector_store.add_documents(documents=documents, uuids=uuids)
 
     @task()
-    def store_embeddings():
-        pass
+    def finalize_ingestion(
+        source_path: str, page_artifact_path: str, chunk_artifact_path: str
+    ) -> str:
+        """Remove successful-run artifacts and move the source PDF to processed."""
 
-    @task()
-    def move_file_to_processed(source):
-        destination = Path(FILE_PATH_PROCESSED)  # type: ignore
-        source = Path(source)
+        for artifact_path in (page_artifact_path, chunk_artifact_path):
+            try:
+                Path(artifact_path).unlink(missing_ok=True)
+            except OSError:
+                logger.exception("Could not remove staging artifact %s", artifact_path)
 
-        if destination:
-            destination = destination / source.name
-            shutil.move(str(source), str(destination))
-
+        source = Path(source_path)
+        destination_directory = Path(required_setting("FILE_PATH_PROCESSED"))
+        destination_directory.mkdir(parents=True, exist_ok=True)
+        destination = destination_directory / source.name
+        shutil.move(str(source), str(destination))
         return f"File moved to: {destination}"
 
     pdf_path = wait_for_pdf()
-    documents = extract_documents(pdf_path)  # type: ignore
-    chunks = chunk_documents(documents)  # type: ignore
-    embeddings = embed_chunks(chunks)  # type: ignore
+    page_artifact = extract_documents(pdf_path)  # type: ignore[arg-type]
+    chunk_artifact = chunk_documents(page_artifact)
+    embeddings = embed_chunks(chunk_artifact)
+    finalization = finalize_ingestion(pdf_path, page_artifact, chunk_artifact)  # type: ignore[arg-type]
 
-    move_task = move_file_to_processed(pdf_path)
-
-    embeddings >> move_task  # type: ignore
+    embeddings >> finalization
 
 
 policy_ingestion()

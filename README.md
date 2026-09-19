@@ -129,9 +129,9 @@ Policy PDF
     ↓
 Detect / receive file
     ↓
-Load PDF and extract page content
+Load PDF and stage page records
     ↓
-Split content into chunks
+Split staged content and stage chunk records
     ↓
 Attach document metadata
     ↓
@@ -199,6 +199,16 @@ Source text / chunk metadata
 ```
 
 These records can later be queried as part of a Retrieval-Augmented Generation (RAG) workflow.
+
+### Intermediate task data
+
+Airflow XCom carries only the paths of temporary JSON Lines artifacts, never full PDF
+text or LangChain `Document` objects. This keeps orchestration metadata small and
+avoids Airflow's safe-deserialization restrictions. The artifacts are stored in
+`FILE_PATH_STAGING` and removed after a successful embedding and file move.
+
+For a multi-worker deployment, configure this path on a shared persistent volume or
+replace the local staging implementation with object storage.
 
 ### 7. Move the processed file
 
